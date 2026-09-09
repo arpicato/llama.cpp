@@ -518,6 +518,12 @@ struct llama_layer {
     struct ggml_tensor * indexer_comp_ape   = nullptr;
     struct ggml_tensor * indexer_comp_norm  = nullptr;
 
+    // Qwen HCA compressor tensors (custom, not DSV4)
+    struct ggml_tensor * hca_compress_k    = nullptr;
+    struct ggml_tensor * hca_compress_v    = nullptr;
+    struct ggml_tensor * hca_compress_gate = nullptr;
+    struct ggml_tensor * hca_position_bias = nullptr;
+
     // cogvlm
     struct ggml_tensor * visexp_attn_wqkv = nullptr;
     struct ggml_tensor * visexp_attn_wo   = nullptr;

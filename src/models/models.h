@@ -2314,6 +2314,14 @@ struct llama_model_qwen35 : public llama_model_base {
                             int * sections,
                             int   il);
 
+        // HCA: local window + compressed KV attention
+        ggml_tensor * build_layer_attn_hca(
+        llm_graph_input_attn_kv * inp_attn,
+                    ggml_tensor * cur,
+                    ggml_tensor * inp_pos,
+                            int * sections,
+                            int   il);
+
         ggml_tensor * build_layer_attn_linear(
              llm_graph_input_rs * inp,
                     ggml_tensor * cur,
@@ -2459,6 +2467,14 @@ struct llama_model_qwen35moe : public llama_model_base {
         graph(const llama_model & model, const llm_graph_params & params);
     private:
         ggml_tensor * build_layer_attn(
+        llm_graph_input_attn_kv * inp_attn,
+                    ggml_tensor * cur,
+                    ggml_tensor * inp_pos,
+                            int * sections,
+                            int   il);
+
+        // HCA: local window + compressed KV attention
+        ggml_tensor * build_layer_attn_hca(
         llm_graph_input_attn_kv * inp_attn,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,

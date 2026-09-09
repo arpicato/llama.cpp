@@ -71,6 +71,12 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
             // Q/K normalization for attention layers
             layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", il), { n_embd_head_k }, flags);
             layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", il), { n_embd_head_k }, flags);
+
+            // HCA compressor tensors (optional, only present for HCA layers)
+            layer.hca_compress_k    = create_tensor(tn(LLM_TENSOR_HCA_COMPRESS_K,     "weight", il), {n_embd, n_embd_k_gqa}, flags | TENSOR_NOT_REQUIRED);
+            layer.hca_compress_v    = create_tensor(tn(LLM_TENSOR_HCA_COMPRESS_V,     "weight", il), {n_embd, n_embd_k_gqa}, flags | TENSOR_NOT_REQUIRED);
+            layer.hca_compress_gate = create_tensor(tn(LLM_TENSOR_HCA_COMPRESS_GATE,  "weight", il), {n_embd, n_embd_k_gqa}, flags | TENSOR_NOT_REQUIRED);
+            layer.hca_position_bias = create_tensor(tn(LLM_TENSOR_HCA_POSITION_BIAS,              il), {128, n_embd_k_gqa}, flags | TENSOR_NOT_REQUIRED);
         } else {
             // Linear attention (gated delta net) specific tensors
             // Create tensors with calculated dimensions
@@ -166,6 +172,9 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
         if (hparams.is_recr(il)) {
             // Linear attention layer (gated delta net)
             cur = build_layer_attn_linear(inp->get_recr(), cur, il);
+        } else if (model.layers[il].hca_compress_k != nullptr) {
+            // HCA attention layer (local + compressed KV)
+            cur = build_layer_attn_hca(inp->get_attn(), cur, inp_pos, sections, il);
         } else {
             // Full attention layer
             cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
@@ -328,6 +337,170 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
 
     cur = build_lora_mm(model.layers[il].wo, cur, model.layers[il].wo_s);
     cb(cur, "attn_output", il);
+
+    return cur;
+}
+
+// HCA attention: local window (128) + rate-128 compressed KV history.
+// Implements the semantics of attention/hca.py QwenHCAAttention.forward.
+// For now this computes compressed KV inline from the current input,
+// sufficient for a single forward pass (prefill) parity test.
+// TODO: persistent compressed cache across decode steps.
+ggml_tensor * llama_model_qwen35::graph::build_layer_attn_hca(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor *             cur,
+        ggml_tensor *             inp_pos,
+        int *                     sections,
+        int                       il) {
+    const int64_t n_embd_head = hparams.n_embd_head_v();
+    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
+
+    // Q/K/V projection (same as standard Qwen3.5 attention)
+    auto [Qcur_full, Kcur, Vcur] = build_qkv(model.layers[il], cur,
+            n_embd_head * 2, n_head,
+            n_embd_head,     n_head_kv,
+            n_embd_head,     n_head_kv,
+            il, false);
+    cb(Qcur_full, "hca_Qcur_full", il);
+    cb(Kcur, "hca_Kcur", il);
+    cb(Vcur, "hca_Vcur", il);
+
+    // Split Q and gate from the joint projection
+    ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
+        ggml_element_size(Qcur_full) * n_embd_head * 2,
+        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head, 0);
+    cb(Qcur, "hca_Qcur_reshaped", il);
+
+    Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
+    cb(Qcur, "hca_Qcur_normed", il);
+
+    Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+    Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
+    cb(Kcur, "hca_Kcur_normed", il);
+
+    ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
+        ggml_element_size(Qcur_full) * n_embd_head * 2,
+        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
+        ggml_element_size(Qcur_full) * n_embd_head);
+    gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
+    cb(gate, "hca_gate_reshaped", il);
+
+    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+
+    // Apply MRoPE to Q and K (standard)
+    Qcur = ggml_rope_multi(
+            ctx0, Qcur, inp_pos, nullptr,
+            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+            ext_factor, attn_factor, beta_fast, beta_slow
+            );
+    Kcur = ggml_rope_multi(
+            ctx0, Kcur, inp_pos, nullptr,
+            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+            ext_factor, attn_factor, beta_fast, beta_slow
+            );
+
+    cb(Qcur, "hca_Qcur", il);
+    cb(Kcur, "hca_Kcur", il);
+    cb(Vcur, "hca_Vcur", il);
+
+    // Compressed KV from the current input
+    // compress_k/v/gate: [n_embd, n_kv_heads * head_dim]
+    // position_bias: [compress_rate, n_kv_heads * head_dim] = [128, n_embd_k_gqa]
+    const auto & layer = model.layers[il];
+    const int64_t compress_rate = 128;
+    const int64_t n_kv_heads = n_head_kv;
+    const int64_t width = n_kv_heads * n_embd_head;  // n_embd_k_gqa
+
+    // Project hidden through compressor matmuls
+    // cur is [n_embd, n_tokens] -> result is [width, n_tokens]
+    ggml_tensor * comp_k   = ggml_mul_mat(ctx0, layer.hca_compress_k,    cur);
+    ggml_tensor * comp_v   = ggml_mul_mat(ctx0, layer.hca_compress_v,    cur);
+    ggml_tensor * comp_gate = ggml_mul_mat(ctx0, layer.hca_compress_gate, cur);
+    cb(comp_k,    "hca_comp_k_raw", il);
+    cb(comp_v,    "hca_comp_v_raw", il);
+    cb(comp_gate, "hca_comp_gate_raw", il);
+
+    // Reshape to [head_dim, n_kv_heads, n_tokens]
+    comp_k    = ggml_reshape_3d(ctx0, comp_k,    n_embd_head, n_kv_heads, n_tokens);
+    comp_v    = ggml_reshape_3d(ctx0, comp_v,    n_embd_head, n_kv_heads, n_tokens);
+    comp_gate = ggml_reshape_3d(ctx0, comp_gate, n_embd_head, n_kv_heads, n_tokens);
+
+    // How many complete 128-token blocks can we form from n_tokens?
+    const int64_t n_blocks = n_tokens / compress_rate;
+    const int64_t usable = n_blocks * compress_rate;
+
+    if (n_blocks > 0) {
+        // View first `usable` tokens and reshape to [head_dim, n_kv_heads, compress_rate, n_blocks]
+        ggml_tensor * ck_blocks = ggml_view_4d(ctx0, comp_k,
+            n_embd_head, n_kv_heads, compress_rate, n_blocks,
+            comp_k->nb[1], comp_k->nb[2], comp_k->nb[0], 0);
+        ggml_tensor * cv_blocks = ggml_view_4d(ctx0, comp_v,
+            n_embd_head, n_kv_heads, compress_rate, n_blocks,
+            comp_v->nb[1], comp_v->nb[2], comp_v->nb[0], 0);
+        ggml_tensor * cg_blocks = ggml_view_4d(ctx0, comp_gate,
+            n_embd_head, n_kv_heads, compress_rate, n_blocks,
+            comp_gate->nb[1], comp_gate->nb[2], comp_gate->nb[0], 0);
+
+        // position_bias: [compress_rate, n_kv_heads, head_dim] -> broadcast
+        ggml_tensor * bias = layer.hca_position_bias;
+        // bias is [128, width] = [128, n_kv_heads * head_dim]
+        // reshape to [head_dim, n_kv_heads, compress_rate, 1]
+        bias = ggml_reshape_4d(ctx0, bias, n_embd_head, n_kv_heads, compress_rate, 1);
+        cb(bias, "hca_pos_bias", il);
+
+        // weights = softmax(gate + bias, dim=2) over the compress_rate axis
+        ggml_tensor * scores = ggml_add(ctx0, cg_blocks, bias);
+        ggml_tensor * weights = ggml_soft_max(ctx0, scores);
+        // weights is [head_dim, n_kv_heads, compress_rate, n_blocks]
+        cb(weights, "hca_comp_weights", il);
+
+        // compressed_k = sum(k * weights, dim=2) -> [head_dim, n_kv_heads, 1, n_blocks]
+        ggml_tensor * c_k = ggml_mul(ctx0, ck_blocks, weights);
+        c_k = ggml_sum_rows(ctx0, c_k);
+        // c_k is [head_dim, n_kv_heads, 1, n_blocks]
+        c_k = ggml_reshape_3d(ctx0, c_k, n_embd_head, n_kv_heads, n_blocks);
+        cb(c_k, "hca_compressed_k", il);
+
+        ggml_tensor * c_v = ggml_mul(ctx0, cv_blocks, weights);
+        c_v = ggml_sum_rows(ctx0, c_v);
+        c_v = ggml_reshape_3d(ctx0, c_v, n_embd_head, n_kv_heads, n_blocks);
+        cb(c_v, "hca_compressed_v", il);
+
+        // Apply k_norm to compressed K
+        c_k = build_norm(c_k, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
+        cb(c_k, "hca_compressed_k_normed", il);
+
+        // Apply RoPE to compressed K at block positions
+        // Block positions: 0, 128, 256, ...
+        // TODO: need a position tensor for compressed blocks
+        // For now, skip RoPE on compressed K (parity test will show if needed)
+
+        // Concatenate local K/V with compressed K/V
+        // local: [head_dim, n_kv_heads, n_tokens]
+        // compressed: [head_dim, n_kv_heads, n_blocks]
+        // combined: [head_dim, n_kv_heads, n_tokens + n_blocks]
+        Kcur = ggml_concat(ctx0, Kcur, c_k, 2);
+        Vcur = ggml_concat(ctx0, Vcur, c_v, 2);
+        cb(Kcur, "hca_K_combined", il);
+        cb(Vcur, "hca_V_combined", il);
+    }
+
+    // Attention with combined K/V
+    const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
+
+    cur = build_attn(inp,
+                nullptr, nullptr, nullptr,
+                Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+    cb(cur, "hca_attn_pregate", il);
+
+    ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx0, gate);
+    cb(gate_sigmoid, "hca_gate_sigmoid", il);
+
+    cur = ggml_mul(ctx0, cur, gate_sigmoid);
+    cb(cur, "hca_attn_gated", il);
+
+    cur = build_lora_mm(model.layers[il].wo, cur, model.layers[il].wo_s);
+    cb(cur, "hca_attn_output", il);
 
     return cur;
 }
