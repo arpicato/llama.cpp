@@ -348,6 +348,10 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
 
     this->mctx = mctx;
 
+    return can_reuse_impl(params);
+}
+
+bool llm_graph_input_rs::can_reuse_impl(const llm_graph_params & params) {
     bool res = true;
 
     res &= s_copy->ne[0] == mctx->get_n_rs();
@@ -469,8 +473,14 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
-    mctx->set_input_k_idxs(self_k_idxs, ubatch);
-    mctx->set_input_v_idxs(self_v_idxs, ubatch);
+    // idxs are left unallocated when no layer consumes this cache
+    // (e.g. all full-attn layers converted to HCA)
+    if (self_k_idxs && self_k_idxs->buffer) {
+        mctx->set_input_k_idxs(self_k_idxs, ubatch);
+    }
+    if (self_v_idxs && self_v_idxs->buffer) {
+        mctx->set_input_v_idxs(self_v_idxs, ubatch);
+    }
 
     // the mask is left unallocated when the graph only stores K/V without attending
     // (e.g. DFlash's KV-injection pass)
@@ -492,6 +502,10 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
 
     this->mctx = mctx;
 
+    return can_reuse_impl(params);
+}
+
+bool llm_graph_input_attn_kv::can_reuse_impl(const llm_graph_params & params) {
     bool res = true;
 
     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
@@ -1060,6 +1074,10 @@ bool llm_graph_input_dsv4::can_reuse(const llm_graph_params & params) {
     this->mctx = mctx;
     inp_raw->mctx = mctx->get_raw();
 
+    return can_reuse_impl(params);
+}
+
+bool llm_graph_input_dsv4::can_reuse_impl(const llm_graph_params & params) {
     bool res = true;
 
     const auto & plan_csa = mctx->get_csa_plan(params.ubatch);
@@ -1068,7 +1086,6 @@ bool llm_graph_input_dsv4::can_reuse(const llm_graph_params & params) {
     const int64_t n_stream = plan_csa.n_stream;
 
     const auto * raw_ctx = mctx->get_raw();
-    inp_raw->mctx = raw_ctx;
 
     if (inp_raw->self_k_idxs && inp_raw->self_k_idxs->buffer) {
         res &= inp_raw->self_k_idxs->ne[0] == raw_ctx->get_n_write();
@@ -1308,8 +1325,25 @@ void llm_graph_input_mem_hybrid_hca::set_input(const llama_ubatch * ubatch) {
 }
 
 bool llm_graph_input_mem_hybrid_hca::can_reuse(const llm_graph_params & params) {
-    GGML_UNUSED(params);
-    return false;
+    const auto * mctx = static_cast<const llama_memory_hybrid_hca_context *>(params.mctx);
+
+    // rebind children to the current contexts, like the iswa wrapper does
+    inp_full->mctx = mctx->get_full();
+    inp_hca->mctx  = mctx->get_hca();
+    inp_hca->get_raw()->mctx = mctx->get_hca()->get_raw();
+    inp_rs->mctx   = mctx->get_recr();
+
+    bool res = true;
+
+    // the full-attn cache may have no layers if all are converted to HCA
+    if (inp_full->self_k_idxs && inp_full->self_k_idxs->buffer) {
+        res &= inp_full->can_reuse_impl(params);
+    }
+
+    res &= inp_hca->can_reuse_impl(params);
+    res &= inp_rs->can_reuse_impl(params);
+
+    return res;
 }
 
 void llm_graph_input_sampling::set_input(const llama_ubatch * ubatch) {

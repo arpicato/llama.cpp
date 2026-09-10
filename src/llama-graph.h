@@ -268,6 +268,8 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override;
 
+    bool can_reuse_impl(const llm_graph_params & params);
+
     ggml_tensor * s_copy;  // I32 [n_rs]
 
     // views of s_copy, computed once per graph
@@ -333,6 +335,8 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
+
+    bool can_reuse_impl(const llm_graph_params & params);
 
     ggml_tensor * get_k_idxs() const { return self_k_idxs; }
     ggml_tensor * get_v_idxs() const { return self_v_idxs; }
@@ -630,6 +634,8 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
+
+    bool can_reuse_impl(const llm_graph_params & params);
 
     llm_graph_input_dsv4_raw * get_raw() const { return inp_raw.get(); }
     const comp_input & get_csa() const { return inp_csa; }

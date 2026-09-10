@@ -179,6 +179,21 @@ static std::vector<llama_ubatch> dsv4_build_raw_write_ubatches(const std::vector
     return res;
 }
 
+static llama_kv_cache::slot_info dsv4_build_full_sinfo(const llama_kv_cache * kv) {
+    const uint32_t n_stream = kv->get_n_stream();
+
+    llama_kv_cache::slot_info sinfo;
+    sinfo.s0 = 0;
+    sinfo.s1 = n_stream - 1;
+    sinfo.resize(n_stream);
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        sinfo.strm[s] = s;
+        sinfo.idxs[s].resize(1, 0);
+    }
+
+    return sinfo;
+}
+
 static bool dsv4_batch_has_coupled(const llama_batch & batch) {
     if (!batch.n_seq_id) {
         return false;
@@ -1364,7 +1379,13 @@ llama_memory_context_ptr llama_kv_cache_dsv4::init_batch(
     const auto make_context = [&](std::vector<llama_ubatch> ubatches) -> llama_memory_context_ptr {
         auto ubatches_raw = dsv4_build_raw_write_ubatches(ubatches);
 
-        auto sinfos_raw_base_write = kv_raw->get_base()->prepare(ubatches_raw);
+        // the raw base cache is empty when every raw layer is SWA, which happens
+        // when all full-attn layers are converted to HCA (qwen35 forces HCA
+        // layers to SWA). no node consumes the base, so use one dummy sinfo per
+        // write ubatch to keep the base context indexable.
+        auto sinfos_raw_base_write = kv_raw->get_base()->get_layer_ids().empty() ?
+            llama_kv_cache::slot_info_vec_t(ubatches_raw.size(), dsv4_build_full_sinfo(kv_raw->get_base())) :
+            kv_raw->get_base()->prepare(ubatches_raw);
         if (sinfos_raw_base_write.empty()) {
             return nullptr;
         }
@@ -1463,7 +1484,9 @@ llama_memory_context_ptr llama_kv_cache_dsv4::init_update(llama_context * lctx, 
 
 llama_memory_context_ptr llama_kv_cache_dsv4::prepare(const std::vector<llama_ubatch> & ubatches) {
     auto ubatches_raw = dsv4_build_raw_write_ubatches(ubatches);
-    auto sinfos_raw_base = kv_raw->get_base()->prepare(ubatches_raw);
+    auto sinfos_raw_base = kv_raw->get_base()->get_layer_ids().empty() ?
+        llama_kv_cache::slot_info_vec_t(ubatches_raw.size(), dsv4_build_full_sinfo(kv_raw->get_base())) :
+        kv_raw->get_base()->prepare(ubatches_raw);
     auto sinfos_raw_swa = kv_raw->get_swa()->prepare(ubatches_raw);
     if (sinfos_raw_base.empty() || sinfos_raw_swa.empty()) {
         return std::make_unique<llama_kv_cache_dsv4_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
@@ -1807,21 +1830,6 @@ void llama_kv_cache_dsv4::clear_compressed(llama_seq_id seq_id, bool data) {
 //
 // llama_kv_cache_dsv4_raw_context
 //
-
-static llama_kv_cache::slot_info dsv4_build_full_sinfo(const llama_kv_cache * kv) {
-    const uint32_t n_stream = kv->get_n_stream();
-
-    llama_kv_cache::slot_info sinfo;
-    sinfo.s0 = 0;
-    sinfo.s1 = n_stream - 1;
-    sinfo.resize(n_stream);
-    for (uint32_t s = 0; s < n_stream; ++s) {
-        sinfo.strm[s] = s;
-        sinfo.idxs[s].resize(1, 0);
-    }
-
-    return sinfo;
-}
 
 llama_kv_cache_dsv4_raw_context::llama_kv_cache_dsv4_raw_context(llama_kv_cache_iswa * kv) :
     kv_swa(kv->get_swa()),
