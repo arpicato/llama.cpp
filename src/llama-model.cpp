@@ -2472,6 +2472,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             cparams.n_ubatch,
                             1,
                             cparams.n_rs_seq,
+                            false,
                             nullptr,
                             nullptr);
                 }
@@ -2560,7 +2561,12 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         }
                     }
 
-                    if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+                    if (arch == LLM_ARCH_QWEN35 && hparams.is_swa_any()) {
+                        res = new llama_memory_hybrid_hca(
+                            *this, params.type_k, params.type_v, !cparams.flash_attn,
+                            cparams.n_ctx_seq, cparams.n_ubatch, cparams.n_seq_max, cparams.n_rs_seq,
+                            cparams.offload_kqv, cparams.kv_unified);
+                    } else if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         // Use hybrid-iswa for hybrid models with SWA
                         res = new llama_memory_hybrid_iswa(
                             /* model             */ *this,

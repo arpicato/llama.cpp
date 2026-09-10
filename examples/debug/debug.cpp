@@ -194,7 +194,28 @@ static bool run(llama_context * ctx, const common_params & params) {
         return false;
     }
 
-    if (llama_decode(ctx, llama_batch_get_one(tokens.data(), tokens.size()))) {
+    size_t offset = 0;
+    if (const char * chunks = getenv("LLAMA_DEBUG_DECODE_CHUNKS")) {
+        const char * next = chunks;
+        while (*next) {
+            char * end = nullptr;
+            const long count = strtol(next, &end, 10);
+            if (end == next || count <= 0 || offset + count > tokens.size()) {
+                LOG_ERR("%s : invalid LLAMA_DEBUG_DECODE_CHUNKS\n", __func__);
+                return false;
+            }
+            if (llama_decode(ctx, llama_batch_get_one(tokens.data() + offset, count))) {
+                LOG_ERR("%s : failed to eval\n", __func__);
+                return false;
+            }
+            offset += count;
+            next = *end == ',' ? end + 1 : end;
+        }
+        if (offset != tokens.size()) {
+            LOG_ERR("%s : LLAMA_DEBUG_DECODE_CHUNKS covers %zu of %zu tokens\n", __func__, offset, tokens.size());
+            return false;
+        }
+    } else if (llama_decode(ctx, llama_batch_get_one(tokens.data(), tokens.size()))) {
         LOG_ERR("%s : failed to eval\n", __func__);
         return false;
     }

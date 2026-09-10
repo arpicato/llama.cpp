@@ -4,13 +4,19 @@
 #include "log.h"
 
 #include <cmath>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <regex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 struct common_debug_cb_user_data::impl {
     std::vector<uint8_t>    data;
     std::vector<std::regex> tensor_filters;
+    std::filesystem::path   dump_dir;
+    std::unordered_map<std::string, uint32_t> dump_counts;
     bool                    abort_on_nan{false};
 };
 
@@ -29,6 +35,10 @@ common_debug_cb_user_data::common_debug_cb_user_data(common_params & params, con
         }
     }
     pimpl->abort_on_nan = abort_on_nan;
+    if (const char * dump_dir = getenv("LLAMA_DEBUG_TENSOR_DUMP_DIR")) {
+        pimpl->dump_dir = dump_dir;
+        std::filesystem::create_directories(pimpl->dump_dir);
+    }
 
     params.cb_eval           = common_debug_cb_eval;
     params.cb_eval_user_data = this;
@@ -147,10 +157,6 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
     const struct ggml_tensor * src0 = t->src[0];
     const struct ggml_tensor * src1 = t->src[1];
 
-    if (ask) {
-        return true;  // Always retrieve data
-    }
-
     bool matches_filter = pimpl->tensor_filters.empty();
 
     if (!matches_filter) {
@@ -160,6 +166,10 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
                 break;
             }
         }
+    }
+
+    if (ask) {
+        return matches_filter;
     }
 
     char src1_str[128] = { 0 };
@@ -184,6 +194,23 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
     if (!ggml_is_quantized(t->type) && matches_filter) {
         uint8_t * data = is_host ? (uint8_t *) t->data : pimpl->data.data();
         common_debug_print_tensor(data, t->type, t->ne, t->nb, 3, pimpl->abort_on_nan);
+
+        if (!pimpl->dump_dir.empty()) {
+            const uint32_t index = pimpl->dump_counts[t->name]++;
+            const auto path = pimpl->dump_dir / (std::string(t->name) + "-" + std::to_string(index) + ".f32");
+            std::ofstream file(path, std::ios::binary);
+            for (int64_t i3 = 0; i3 < t->ne[3]; ++i3) {
+                for (int64_t i2 = 0; i2 < t->ne[2]; ++i2) {
+                    for (int64_t i1 = 0; i1 < t->ne[1]; ++i1) {
+                        for (int64_t i0 = 0; i0 < t->ne[0]; ++i0) {
+                            const float value = common_ggml_get_float_value(data, t->type, t->nb, i0, i1, i2, i3);
+                            file.write(reinterpret_cast<const char *>(&value), sizeof(value));
+                        }
+                    }
+                }
+            }
+            LOG("tensor dump: %s shape={%s}\n", path.c_str(), common_ggml_ne_string(t).c_str());
+        }
     }
 
     return true;

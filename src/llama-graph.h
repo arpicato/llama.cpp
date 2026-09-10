@@ -380,10 +380,12 @@ public:
     bool can_reuse_impl(const llm_graph_params & params);
 
     ggml_tensor * get_k_idxs() const { return self_k_idxs; }
+    ggml_tensor * get_v_idxs() const { return self_v_idxs; }
 
     ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
 
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
+    ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
 
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
@@ -580,9 +582,11 @@ public:
     void set_input(const llama_ubatch * ubatch);
 
     ggml_tensor * get_k_idxs() const { return self_k_idxs; }
+    ggml_tensor * get_v_idxs() const { return self_v_idxs; }
     ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
 
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
+    ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
 
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
@@ -740,6 +744,27 @@ public:
     const llama_cparams cparams;
 
     const llama_memory_hybrid_iswa_context * mctx;
+};
+
+class llm_graph_input_mem_hybrid_hca : public llm_graph_input_i {
+public:
+    llm_graph_input_mem_hybrid_hca(
+            std::unique_ptr<llm_graph_input_attn_kv> inp_full,
+            std::unique_ptr<llm_graph_input_dsv4> inp_hca,
+            std::unique_ptr<llm_graph_input_rs> inp_rs) :
+        inp_full(std::move(inp_full)), inp_hca(std::move(inp_hca)), inp_rs(std::move(inp_rs)) {}
+
+    void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override;
+
+    llm_graph_input_attn_kv * get_full() const { return inp_full.get(); }
+    llm_graph_input_dsv4 * get_hca() const { return inp_hca.get(); }
+    llm_graph_input_rs * get_recr() const { return inp_rs.get(); }
+
+private:
+    std::unique_ptr<llm_graph_input_attn_kv> inp_full;
+    std::unique_ptr<llm_graph_input_dsv4> inp_hca;
+    std::unique_ptr<llm_graph_input_rs> inp_rs;
 };
 
 class llm_graph_input_sampling : public llm_graph_input_i {
@@ -1358,6 +1383,7 @@ struct llm_graph_context {
     llm_graph_input_mem_hybrid_k * build_inp_mem_hybrid_k() const;
 
     llm_graph_input_mem_hybrid_iswa * build_inp_mem_hybrid_iswa() const;
+    llm_graph_input_mem_hybrid_hca * build_inp_mem_hybrid_hca() const;
 
     //
     // pooling

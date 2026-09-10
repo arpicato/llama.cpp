@@ -283,3 +283,112 @@ const llama_kv_cache_iswa_context * llama_memory_hybrid_iswa_context::get_attn()
 const llama_memory_recurrent_context * llama_memory_hybrid_iswa_context::get_recr() const {
     return static_cast<const llama_memory_recurrent_context *>(ctx_recr.get());
 }
+
+llama_memory_hybrid_hca::llama_memory_hybrid_hca(
+        const llama_model & model,
+                ggml_type   type_k,
+                ggml_type   type_v,
+                     bool   v_trans,
+                 uint32_t   kv_size,
+                 uint32_t   n_ubatch,
+                 uint32_t   n_seq_max,
+                 uint32_t   n_rs_seq,
+                     bool   offload,
+                     bool   unified) : n_rs_seq(n_rs_seq) {
+    const auto filter_full = [&](int32_t il) {
+        return !model.hparams.is_recr(il) && model.hparams.dsv4_compress_ratios[il] == 0;
+    };
+    const auto filter_hca = [&](int32_t il) {
+        return !model.hparams.is_recr(il) && model.hparams.dsv4_compress_ratios[il] == 128;
+    };
+    const auto filter_recr = [&](int32_t il) {
+        return model.hparams.is_recr(il);
+    };
+
+    mem_full = std::make_unique<llama_kv_cache>(
+            model, model.hparams, type_k, type_v, v_trans, offload, unified, kv_size, n_seq_max, 1,
+            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_full, nullptr, nullptr);
+    mem_hca = std::make_unique<llama_kv_cache_dsv4>(
+            model, type_k, type_v, false, offload, false, unified, kv_size, n_seq_max, n_ubatch, 1,
+            n_rs_seq, true, filter_hca, nullptr);
+    mem_recr = std::make_unique<llama_memory_recurrent>(
+            model, GGML_TYPE_F32, GGML_TYPE_F32, offload, std::max(1u, n_seq_max), n_seq_max, n_rs_seq, filter_recr);
+}
+
+llama_memory_context_ptr llama_memory_hybrid_hca::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
+    balloc.split_reset();
+    std::vector<llama_ubatch> ubatches;
+    while (true) {
+        llama_ubatch ubatch = embd_all ? balloc.split_seq(n_ubatch) : balloc.split_equal(n_ubatch, true, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+        if (ubatch.n_tokens == 0) {
+            break;
+        }
+        ubatches.push_back(std::move(ubatch));
+    }
+    if (balloc.get_n_used() < balloc.get_n_tokens() || !mem_recr->prepare(ubatches)) {
+        return std::make_unique<llama_memory_hybrid_hca_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+    }
+    auto sinfos = mem_full->prepare(ubatches);
+    if (sinfos.empty()) {
+        return std::make_unique<llama_memory_hybrid_hca_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+    }
+    auto ctx_full = std::make_unique<llama_kv_cache_context>(mem_full.get(), std::move(sinfos), ubatches);
+    auto ctx_hca = mem_hca->prepare(ubatches);
+    if (llama_memory_status_is_fail(ctx_hca->get_status())) {
+        return std::make_unique<llama_memory_hybrid_hca_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+    }
+    return std::make_unique<llama_memory_hybrid_hca_context>(this, std::move(ctx_full), std::move(ctx_hca), std::move(ubatches));
+}
+
+llama_memory_context_ptr llama_memory_hybrid_hca::init_full() {
+    return std::make_unique<llama_memory_hybrid_hca_context>(this, nullptr, false);
+}
+
+llama_memory_context_ptr llama_memory_hybrid_hca::init_update(llama_context * lctx, bool optimize) {
+    return std::make_unique<llama_memory_hybrid_hca_context>(this, lctx, optimize);
+}
+
+bool llama_memory_hybrid_hca::get_can_shift() const { return false; }
+void llama_memory_hybrid_hca::clear(bool data) { mem_full->clear(data); mem_hca->clear(data); mem_recr->clear(data); }
+bool llama_memory_hybrid_hca::seq_rm(llama_seq_id id, llama_pos p0, llama_pos p1) { return mem_recr->seq_rm(id, p0, p1) && mem_full->seq_rm(id, p0, p1) && mem_hca->seq_rm(id, p0, p1); }
+void llama_memory_hybrid_hca::seq_cp(llama_seq_id src, llama_seq_id dst, llama_pos p0, llama_pos p1) { mem_full->seq_cp(src, dst, p0, p1); mem_hca->seq_cp(src, dst, p0, p1); mem_recr->seq_cp(src, dst, p0, p1); }
+void llama_memory_hybrid_hca::seq_keep(llama_seq_id id) { mem_full->seq_keep(id); mem_hca->seq_keep(id); mem_recr->seq_keep(id); }
+void llama_memory_hybrid_hca::seq_add(llama_seq_id id, llama_pos p0, llama_pos p1, llama_pos shift) { mem_full->seq_add(id, p0, p1, shift); mem_hca->seq_add(id, p0, p1, shift); mem_recr->seq_add(id, p0, p1, shift); }
+void llama_memory_hybrid_hca::seq_div(llama_seq_id id, llama_pos p0, llama_pos p1, int d) { mem_full->seq_div(id, p0, p1, d); mem_hca->seq_div(id, p0, p1, d); mem_recr->seq_div(id, p0, p1, d); }
+llama_pos llama_memory_hybrid_hca::seq_pos_min(llama_seq_id id) const { return std::max(mem_full->seq_pos_min(id), std::max(mem_hca->seq_pos_min(id), mem_recr->seq_pos_min(id))); }
+llama_pos llama_memory_hybrid_hca::seq_pos_max(llama_seq_id id) const { return std::min(mem_full->seq_pos_max(id), std::min(mem_hca->seq_pos_max(id), mem_recr->seq_pos_max(id))); }
+
+std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_hca::memory_breakdown() const {
+    auto result = mem_full->memory_breakdown();
+    for (const auto & [type, size] : mem_hca->memory_breakdown()) result[type] += size;
+    for (const auto & [type, size] : mem_recr->memory_breakdown()) result[type] += size;
+    return result;
+}
+
+void llama_memory_hybrid_hca::state_write(llama_io_write_i & io, llama_seq_id id, llama_state_seq_flags flags) const { mem_full->state_write(io, id, flags); mem_hca->state_write(io, id, flags); mem_recr->state_write(io, id, flags); }
+void llama_memory_hybrid_hca::state_read(llama_io_read_i & io, llama_seq_id id, llama_state_seq_flags flags) { mem_full->state_read(io, id, flags); mem_hca->state_read(io, id, flags); mem_recr->state_read(io, id, flags); }
+llama_kv_cache * llama_memory_hybrid_hca::get_full() const { return mem_full.get(); }
+llama_kv_cache_dsv4 * llama_memory_hybrid_hca::get_hca() const { return mem_hca.get(); }
+llama_memory_recurrent * llama_memory_hybrid_hca::get_recr() const { return mem_recr.get(); }
+
+llama_memory_hybrid_hca_context::llama_memory_hybrid_hca_context(llama_memory_status status) : status(status) {}
+
+llama_memory_hybrid_hca_context::llama_memory_hybrid_hca_context(llama_memory_hybrid_hca * mem, llama_context * lctx, bool optimize) :
+    ctx_full(lctx ? mem->get_full()->init_update(lctx, optimize) : mem->get_full()->init_full()),
+    ctx_hca(lctx ? mem->get_hca()->init_update(lctx, optimize) : mem->get_hca()->init_full()),
+    ctx_recr(lctx ? mem->get_recr()->init_update(lctx, optimize) : mem->get_recr()->init_full()),
+    status(llama_memory_status_combine(ctx_full->get_status(), llama_memory_status_combine(ctx_hca->get_status(), ctx_recr->get_status()))) {}
+
+llama_memory_hybrid_hca_context::llama_memory_hybrid_hca_context(
+        llama_memory_hybrid_hca * mem, llama_memory_context_ptr ctx_full, llama_memory_context_ptr ctx_hca, std::vector<llama_ubatch> ubatches) :
+    ubatches(std::move(ubatches)), ctx_full(std::move(ctx_full)), ctx_hca(std::move(ctx_hca)),
+    ctx_recr(std::make_unique<llama_memory_recurrent_context>(mem->get_recr(), this->ubatches)),
+    status(llama_memory_status_combine(this->ctx_full->get_status(), llama_memory_status_combine(this->ctx_hca->get_status(), ctx_recr->get_status()))) {}
+
+bool llama_memory_hybrid_hca_context::next() { ctx_full->next(); ctx_hca->next(); ctx_recr->next(); return ++i_next < ubatches.size(); }
+bool llama_memory_hybrid_hca_context::apply() { return ctx_full->apply() && ctx_hca->apply() && ctx_recr->apply(); }
+llama_memory_status llama_memory_hybrid_hca_context::get_status() const { return status; }
+const llama_ubatch & llama_memory_hybrid_hca_context::get_ubatch() const { return ubatches[i_next]; }
+const llama_kv_cache_context * llama_memory_hybrid_hca_context::get_full() const { return static_cast<const llama_kv_cache_context *>(ctx_full.get()); }
+const llama_kv_cache_dsv4_context * llama_memory_hybrid_hca_context::get_hca() const { return static_cast<const llama_kv_cache_dsv4_context *>(ctx_hca.get()); }
+const llama_memory_recurrent_context * llama_memory_hybrid_hca_context::get_recr() const { return static_cast<const llama_memory_recurrent_context *>(ctx_recr.get()); }

@@ -22,6 +22,7 @@ public:
             uint32_t        ratio,
             uint32_t        state_size,
             uint32_t        n_embd_state,
+            uint32_t        n_embd_score,
             uint32_t        n_rs_seq,
             const char    * name,
         const llama_memory_i::layer_filter_cb & filter);
@@ -63,6 +64,7 @@ private:
     const uint32_t ratio;
     const uint32_t state_size;
     const uint32_t n_embd_state;
+    const uint32_t n_embd_score;
     const uint32_t n_stream;
     const uint32_t n_rs_seq;
 
@@ -100,6 +102,7 @@ public:
                      uint32_t   n_ubatch,
                      uint32_t   n_pad,
                      uint32_t   n_rs_seq,
+                         bool   qwen_hca,
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse);
 
@@ -117,6 +120,8 @@ public:
     llama_memory_context_ptr init_full() override;
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
+
+    llama_memory_context_ptr prepare(const std::vector<llama_ubatch> & ubatches);
 
     bool get_can_shift() const override;
 
@@ -205,12 +210,16 @@ public:
     uint32_t get_n_write() const;
 
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
+    ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const;
 
     ggml_tensor * build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
+    ggml_tensor * build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
 
     void set_input_k_idxs(ggml_tensor * dst) const;
+    void set_input_v_idxs(ggml_tensor * dst) const;
     void set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_k_rot(ggml_tensor * dst) const;
 
@@ -248,9 +257,13 @@ public:
     bool next();
 
     uint32_t get_n_kv() const;
+    uint32_t get_size() const;
+    std::vector<uint32_t> get_layer_ids() const;
 
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
+    ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const;
 
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     void set_input_k_rot(ggml_tensor * dst) const;

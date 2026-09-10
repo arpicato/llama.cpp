@@ -18,6 +18,7 @@
 
 #include <cassert>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <numeric>
 #include <sstream>
@@ -984,6 +985,9 @@ void llm_graph_input_dsv4_raw::set_input(const llama_ubatch * ubatch) {
     if (self_k_idxs && self_k_idxs->buffer) {
         mctx->set_input_k_idxs(self_k_idxs);
     }
+    if (self_v_idxs && self_v_idxs->buffer) {
+        mctx->set_input_v_idxs(self_v_idxs);
+    }
 
     if (self_kq_mask && self_kq_mask->buffer) {
         mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
@@ -1006,6 +1010,36 @@ void llm_graph_input_dsv4::set_input(const llama_ubatch * ubatch) {
     dsv4_set_comp_inputs(inp_csa, plan_csa, "csa", debug > 0, ubatch->n_tokens, n_stream);
     dsv4_set_comp_inputs(inp_hca, plan_hca, "hca", debug > 0, ubatch->n_tokens, n_stream);
     dsv4_set_comp_inputs(inp_lid, plan_lid, "lid", debug > 0, ubatch->n_tokens, n_stream);
+
+    if (dsv4_compress_debug()) {
+        const auto layer_ids = mctx->get_hca()->get_layer_ids();
+        const uint32_t cache_size = mctx->get_hca()->get_size();
+        for (size_t i = 0; i < plan_hca.state_write_pos.size(); ++i) {
+            const llama_pos source_start = plan_hca.state_write_pos[i];
+            const llama_pos source_end = source_start + 127;
+            bool real_write = false;
+            for (uint32_t j = 0; j < ubatch->n_tokens; ++j) {
+                real_write |= ubatch->pos[j] == source_end;
+            }
+            if (!real_write) {
+                continue;
+            }
+            for (uint32_t il : layer_ids) {
+                fprintf(stderr, "HCA layer %u: compressed tokens %d..%d -> cell %lld\n",
+                        il, source_start, source_end, (long long) (plan_hca.state_write_idxs[i]%cache_size));
+            }
+        }
+
+        for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+            if (plan_hca.n_visible[i] == 0) {
+                continue;
+            }
+            for (uint32_t il : layer_ids) {
+                fprintf(stderr, "HCA layer %u: attention token %d uses cells 0..%d\n",
+                        il, ubatch->pos[i], plan_hca.n_visible[i] - 1);
+            }
+        }
+    }
 
     if (inp_csa.k_rot && inp_csa.k_rot->buffer) {
         mctx->get_csa()->set_input_k_rot(inp_csa.k_rot);
@@ -1265,6 +1299,17 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
 
     return res;
+}
+
+void llm_graph_input_mem_hybrid_hca::set_input(const llama_ubatch * ubatch) {
+    inp_full->set_input(ubatch);
+    inp_hca->set_input(ubatch);
+    inp_rs->set_input(ubatch);
+}
+
+bool llm_graph_input_mem_hybrid_hca::can_reuse(const llm_graph_params & params) {
+    GGML_UNUSED(params);
+    return false;
 }
 
 void llm_graph_input_sampling::set_input(const llama_ubatch * ubatch) {
@@ -3447,6 +3492,7 @@ llm_graph_input_dsv4 * llm_graph_context::build_inp_dsv4() const {
     GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE && "DSV4 expects SWA raw cache");
 
     inp_raw->self_k_idxs = raw_ctx->build_input_k_idxs(ctx0, ubatch);
+    inp_raw->self_v_idxs = raw_ctx->build_input_v_idxs(ctx0, ubatch);
     inp_raw->self_kq_mask = dsv4_build_raw_kq_mask(ctx0, raw_ctx, ubatch, cparams, n_stream);
     inp_raw->self_kq_mask_cnv = inp_raw->self_kq_mask;
 
@@ -3634,6 +3680,32 @@ llm_graph_input_mem_hybrid_iswa * llm_graph_context::build_inp_mem_hybrid_iswa()
     auto inp = std::make_unique<llm_graph_input_mem_hybrid_iswa>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
 
     return (llm_graph_input_mem_hybrid_iswa *) res->add_input(std::move(inp));
+}
+
+llm_graph_input_mem_hybrid_hca * llm_graph_context::build_inp_mem_hybrid_hca() const {
+    const auto * mctx_cur = static_cast<const llama_memory_hybrid_hca_context *>(mctx);
+
+    llama_hparams hparams_full = hparams;
+    hparams_full.swa_type = LLAMA_SWA_TYPE_NONE;
+    auto inp_full = build_attn_inp_kv_impl(ctx0, ubatch, hparams_full, cparams, mctx_cur->get_full());
+    auto inp_rs = build_rs_inp_impl(ctx0, ubatch, mctx_cur->get_recr());
+
+    const auto * hca_ctx = mctx_cur->get_hca();
+    const auto * raw_ctx = hca_ctx->get_raw();
+    auto inp_raw = std::make_unique<llm_graph_input_dsv4_raw>(cparams, raw_ctx);
+    const int64_t n_stream = hca_ctx->get_hca_plan(ubatch).n_stream;
+    inp_raw->self_k_idxs = raw_ctx->build_input_k_idxs(ctx0, ubatch);
+    inp_raw->self_v_idxs = raw_ctx->build_input_v_idxs(ctx0, ubatch);
+    inp_raw->self_kq_mask = dsv4_build_raw_kq_mask(ctx0, raw_ctx, ubatch, cparams, n_stream);
+    inp_raw->self_kq_mask_cnv = inp_raw->self_kq_mask;
+    inp_raw->self_k_rot = raw_ctx->build_input_k_rot(ctx0);
+
+    auto inp_hca = std::make_unique<llm_graph_input_dsv4>(cparams, std::move(inp_raw), hca_ctx);
+    dsv4_build_comp_inputs(ctx0, inp_hca->inp_hca, hca_ctx->get_hca_plan(ubatch), "hca", cparams, n_stream);
+    inp_hca->inp_hca.k_rot = hca_ctx->get_hca()->build_input_k_rot(ctx0);
+
+    auto inp = std::make_unique<llm_graph_input_mem_hybrid_hca>(std::move(inp_full), std::move(inp_hca), std::move(inp_rs));
+    return (llm_graph_input_mem_hybrid_hca *) res->add_input(std::move(inp));
 }
 
 void llm_graph_context::build_dense_out(
